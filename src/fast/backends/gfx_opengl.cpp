@@ -1156,7 +1156,7 @@ static GLuint CompilePostShader(GLenum type, const char* source) {
     if (!ok) {
         char log[1024] = {};
         glGetShaderInfoLog(shader, sizeof(log) - 1, nullptr, log);
-        fprintf(stderr, "ReDemake post-process shader failed to compile:\n%s\n", log);
+        SPDLOG_ERROR("ReDemake post-process shader failed to compile: {}", log);
         glDeleteShader(shader);
         return 0;
     }
@@ -1188,7 +1188,7 @@ bool GfxRenderingAPIOGL::InitPostProcess() {
     if (!ok) {
         char log[1024] = {};
         glGetProgramInfoLog(program, sizeof(log) - 1, nullptr, log);
-        fprintf(stderr, "ReDemake post-process program failed to link:\n%s\n", log);
+        SPDLOG_ERROR("ReDemake post-process program failed to link: {}", log);
         glDeleteProgram(program);
         return false;
     }
@@ -1208,24 +1208,48 @@ void* GfxRenderingAPIOGL::ApplyPostProcess(int fb_id) {
     void* original = GetFramebufferTextureId(fb_id);
 
     auto cvars = Ship::Context::GetRawInstance()->GetConsoleVariables();
+    static bool sLoggedReached = false;
+    if (!sLoggedReached) {
+        sLoggedReached = true;
+        SPDLOG_INFO("ReDemake post-process: reached on the OpenGL backend (RemakePostFx={}, GL_VERSION={}, GL_RENDERER={})",
+                    cvars->GetInteger("gEnhancements.RemakePostFx", 0), (const char*)glGetString(GL_VERSION),
+                    (const char*)glGetString(GL_RENDERER));
+    }
     if (cvars->GetInteger("gEnhancements.RemakePostFx", 0) == 0) {
         return original;
     }
+    static bool sLoggedBadFb = false;
     if (fb_id <= 0 || fb_id >= (int)mFrameBuffers.size()) {
+        if (!sLoggedBadFb) {
+            sLoggedBadFb = true;
+            SPDLOG_INFO("ReDemake post-process: skipped, bad framebuffer id {} (count {})", fb_id,
+                        (int)mFrameBuffers.size());
+        }
         return original;
     }
     const uint32_t width = mFrameBuffers[fb_id].width;
     const uint32_t height = mFrameBuffers[fb_id].height;
+    static bool sLoggedZeroSize = false;
     if (width == 0 || height == 0) {
+        if (!sLoggedZeroSize) {
+            sLoggedZeroSize = true;
+            SPDLOG_INFO("ReDemake post-process: skipped, framebuffer {} has size {}x{}", fb_id, width, height);
+        }
         return original;
     }
 
     if (!mPostInitTried) {
         mPostInitTried = true;
         mPostReady = InitPostProcess();
+        SPDLOG_INFO("ReDemake post-process: shader init {}", mPostReady ? "OK" : "FAILED");
     }
     if (!mPostReady) {
         return original;
+    }
+    static bool sLoggedDraw = false;
+    if (!sLoggedDraw) {
+        sLoggedDraw = true;
+        SPDLOG_INFO("ReDemake post-process: drawing effect on framebuffer {} ({}x{})", fb_id, width, height);
     }
 
     const float contrast = std::clamp(cvars->GetInteger("gEnhancements.RemakePostFxContrast", 110), 50, 150) / 100.0f;

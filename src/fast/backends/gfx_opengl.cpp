@@ -6,6 +6,7 @@
 #include <stdio.h>
 
 #include <map>
+#include <algorithm>
 #include <unordered_map>
 
 #ifndef _LANGUAGE_C
@@ -1104,6 +1105,188 @@ void GfxRenderingAPIOGL::SetSrgbMode() {
 
 ImTextureID GfxRenderingAPIOGL::GetTextureById(int id) {
     return reinterpret_cast<ImTextureID>(id);
+}
+
+// ---------------------------------------------------------------------------------------------------------------
+// Post-processing: color grading applied to the finished game image.
+// The game image is a texture; the GPU cannot read and write the same texture, so we draw it through a shader into
+// a second texture and hand that one to the GUI instead.
+// ---------------------------------------------------------------------------------------------------------------
+#ifdef __APPLE__
+#define POST_GLSL_HEADER "#version 410 core\n"
+#elif defined(USE_OPENGLES)
+#define POST_GLSL_HEADER "#version 300 es\nprecision highp float;\nprecision highp int;\nprecision highp sampler2D;\n"
+#else
+#define POST_GLSL_HEADER "#version 130\n"
+#endif
+
+static const char* kPostVertexSource = POST_GLSL_HEADER
+    "void main() {\n"
+    "    // One big triangle that covers the whole screen, no vertex buffer needed.\n"
+    "    vec2 p = vec2((gl_VertexID == 1) ? 3.0 : -1.0, (gl_VertexID == 2) ? 3.0 : -1.0);\n"
+    "    gl_Position = vec4(p, 0.0, 1.0);\n"
+    "}\n";
+
+static const char* kPostFragmentSource = POST_GLSL_HEADER
+    "uniform sampler2D uTex;\n"
+    "uniform float uContrast;\n"
+    "uniform float uSaturation;\n"
+    "uniform float uWarmth;\n"
+    "out vec4 oColor;\n"
+    "void main() {\n"
+    "    // 1:1 pixel copy (same size), so the image orientation is kept exactly as the game made it.\n"
+    "    vec3 c = texelFetch(uTex, ivec2(gl_FragCoord.xy), 0).rgb;\n"
+    "    float luma = dot(c, vec3(0.2126, 0.7152, 0.0722));\n"
+    "    c = mix(vec3(luma), c, uSaturation);\n"
+    "    c = (c - 0.5) * uContrast + 0.5;\n"
+    "    // Split toning: warm highlights, cool shadows (scaled by uWarmth, negative values do the opposite).\n"
+    "    float l = clamp(dot(c, vec3(0.2126, 0.7152, 0.0722)), 0.0, 1.0);\n"
+    "    c.r += uWarmth * (0.08 * l - 0.03 * (1.0 - l));\n"
+    "    c.g += uWarmth * (0.02 * l);\n"
+    "    c.b += uWarmth * (-0.08 * l + 0.05 * (1.0 - l));\n"
+    "    oColor = vec4(clamp(c, 0.0, 1.0), 1.0);\n"
+    "}\n";
+
+static GLuint CompilePostShader(GLenum type, const char* source) {
+    GLuint shader = glCreateShader(type);
+    glShaderSource(shader, 1, &source, nullptr);
+    glCompileShader(shader);
+    GLint ok = 0;
+    glGetShaderiv(shader, GL_COMPILE_STATUS, &ok);
+    if (!ok) {
+        char log[1024] = {};
+        glGetShaderInfoLog(shader, sizeof(log) - 1, nullptr, log);
+        fprintf(stderr, "ReDemake post-process shader failed to compile:\n%s\n", log);
+        glDeleteShader(shader);
+        return 0;
+    }
+    return shader;
+}
+
+bool GfxRenderingAPIOGL::InitPostProcess() {
+    GLuint vs = CompilePostShader(GL_VERTEX_SHADER, kPostVertexSource);
+    GLuint fs = CompilePostShader(GL_FRAGMENT_SHADER, kPostFragmentSource);
+    if (vs == 0 || fs == 0) {
+        if (vs != 0) {
+            glDeleteShader(vs);
+        }
+        if (fs != 0) {
+            glDeleteShader(fs);
+        }
+        return false;
+    }
+
+    GLuint program = glCreateProgram();
+    glAttachShader(program, vs);
+    glAttachShader(program, fs);
+    glLinkProgram(program);
+    glDeleteShader(vs);
+    glDeleteShader(fs);
+
+    GLint ok = 0;
+    glGetProgramiv(program, GL_LINK_STATUS, &ok);
+    if (!ok) {
+        char log[1024] = {};
+        glGetProgramInfoLog(program, sizeof(log) - 1, nullptr, log);
+        fprintf(stderr, "ReDemake post-process program failed to link:\n%s\n", log);
+        glDeleteProgram(program);
+        return false;
+    }
+
+    mPostProgram = program;
+    mPostLocContrast = glGetUniformLocation(program, "uContrast");
+    mPostLocSaturation = glGetUniformLocation(program, "uSaturation");
+    mPostLocWarmth = glGetUniformLocation(program, "uWarmth");
+
+    glGenVertexArrays(1, &mPostVao);
+    glGenFramebuffers(1, &mPostFbo);
+    glGenTextures(1, &mPostTex);
+    return true;
+}
+
+void* GfxRenderingAPIOGL::ApplyPostProcess(int fb_id) {
+    void* original = GetFramebufferTextureId(fb_id);
+
+    auto cvars = Ship::Context::GetRawInstance()->GetConsoleVariables();
+    if (cvars->GetInteger("gEnhancements.RemakePostFx", 0) == 0) {
+        return original;
+    }
+    if (fb_id <= 0 || fb_id >= (int)mFrameBuffers.size()) {
+        return original;
+    }
+    const uint32_t width = mFrameBuffers[fb_id].width;
+    const uint32_t height = mFrameBuffers[fb_id].height;
+    if (width == 0 || height == 0) {
+        return original;
+    }
+
+    if (!mPostInitTried) {
+        mPostInitTried = true;
+        mPostReady = InitPostProcess();
+    }
+    if (!mPostReady) {
+        return original;
+    }
+
+    const float contrast = std::clamp(cvars->GetInteger("gEnhancements.RemakePostFxContrast", 110), 50, 150) / 100.0f;
+    const float saturation =
+        std::clamp(cvars->GetInteger("gEnhancements.RemakePostFxSaturation", 120), 0, 200) / 100.0f;
+    const float warmth = std::clamp(cvars->GetInteger("gEnhancements.RemakePostFxWarmth", 15), -50, 50) / 100.0f;
+
+    // (Re)create the output texture when the game image size changes.
+    if (mPostWidth != width || mPostHeight != height) {
+        SelectTexture(0, mPostTex);
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB8, width, height, 0, GL_RGB, GL_UNSIGNED_BYTE, NULL);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+        glBindFramebuffer(GL_FRAMEBUFFER, mPostFbo);
+        glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, mPostTex, 0);
+        mPostWidth = width;
+        mPostHeight = height;
+    }
+
+    // Save the state we are about to change.
+    GLint prevViewport[4];
+    glGetIntegerv(GL_VIEWPORT, prevViewport);
+    GLint prevProgram = 0;
+    glGetIntegerv(GL_CURRENT_PROGRAM, &prevProgram);
+    GLint prevVao = 0;
+    glGetIntegerv(GL_VERTEX_ARRAY_BINDING, &prevVao);
+
+    // Source: the game image, on texture unit 0 (through the cache-aware helper).
+    SelectTextureFb(fb_id);
+
+    glBindFramebuffer(GL_FRAMEBUFFER, mPostFbo);
+    glViewport(0, 0, width, height);
+    if (mLastScissorEnabled != 0) {
+        mLastScissorEnabled = 0;
+        glDisable(GL_SCISSOR_TEST);
+    }
+    if (mLastBlendEnabled != 0) {
+        mLastBlendEnabled = 0;
+        glDisable(GL_BLEND);
+    }
+
+    glUseProgram(mPostProgram);
+    glUniform1f(mPostLocContrast, contrast);
+    glUniform1f(mPostLocSaturation, saturation);
+    glUniform1f(mPostLocWarmth, warmth);
+    glBindVertexArray(mPostVao);
+    glDrawArrays(GL_TRIANGLES, 0, 3);
+
+    // Put everything back the way DrawTriangles expects it.
+    glBindVertexArray(prevVao);
+    glUseProgram(prevProgram);
+    glViewport(prevViewport[0], prevViewport[1], prevViewport[2], prevViewport[3]);
+    glBindFramebuffer(GL_FRAMEBUFFER, mFrameBuffers[mCurrentFrameBuffer].fbo);
+    if (mLastScissorEnabled != 1) {
+        mLastScissorEnabled = 1;
+        glEnable(GL_SCISSOR_TEST);
+    }
+
+    return (void*)(uintptr_t)mPostTex;
 }
 } // namespace Fast
 #endif

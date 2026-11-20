@@ -79,6 +79,12 @@ class GfxRenderingAPI {
     virtual void SetSrgbMode() = 0;
     virtual ImTextureID GetTextureById(int id) = 0;
     virtual void SetCurrentPrimDepth(float depth) = 0;
+    // Post-processing hook (color grading, etc). Receives the framebuffer holding the finished game image and
+    // returns the texture id that should be shown on screen. The default does nothing, so backends that do not
+    // implement it (DirectX 11, Metal) keep working unchanged.
+    virtual void* ApplyPostProcess(int fbId) {
+        return GetFramebufferTextureId(fbId);
+    }
 
   protected:
     int8_t mCurrentDepthTest = 0;

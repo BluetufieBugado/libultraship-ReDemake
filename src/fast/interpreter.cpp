@@ -5128,12 +5128,12 @@ void Interpreter::RunGuiOnly() {
         if (mMsaaLevel > 1) {
             if (!ViewportMatchesRendererResolution()) {
                 mRapi->ResolveMSAAColorBuffer(mGameFbMsaaResolved, mGameFb);
-                mGfxFrameBuffer = (uintptr_t)mRapi->GetFramebufferTextureId(mGameFbMsaaResolved);
+                mGfxFrameBuffer = (uintptr_t)mRapi->ApplyPostProcess(mGameFbMsaaResolved);
             } else {
                 mRapi->ResolveMSAAColorBuffer(0, mGameFb);
             }
         } else {
-            mGfxFrameBuffer = (uintptr_t)mRapi->GetFramebufferTextureId(mGameFb);
+            mGfxFrameBuffer = (uintptr_t)mRapi->ApplyPostProcess(mGameFb);
         }
     } else if (mFbActive) {
         // Failsafe reset to main framebuffer to prevent softlocking the renderer
@@ -5193,12 +5193,12 @@ void Interpreter::Run(Gfx* commands, const std::unordered_map<Mtx*, MtxF>& mtx_r
         if (mMsaaLevel > 1) {
             if (!ViewportMatchesRendererResolution()) {
                 mRapi->ResolveMSAAColorBuffer(mGameFbMsaaResolved, mGameFb);
-                mGfxFrameBuffer = (uintptr_t)mRapi->GetFramebufferTextureId(mGameFbMsaaResolved);
+                mGfxFrameBuffer = (uintptr_t)mRapi->ApplyPostProcess(mGameFbMsaaResolved);
             } else {
                 mRapi->ResolveMSAAColorBuffer(0, mGameFb);
             }
         } else {
-            mGfxFrameBuffer = (uintptr_t)mRapi->GetFramebufferTextureId(mGameFb);
+            mGfxFrameBuffer = (uintptr_t)mRapi->ApplyPostProcess(mGameFb);
         }
     } else if (mFbActive) {
         // Failsafe reset to main framebuffer to prevent softlocking the renderer

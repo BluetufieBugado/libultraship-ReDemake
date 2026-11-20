@@ -104,11 +104,13 @@ class GfxRenderingAPIOGL final : public GfxRenderingAPI {
     FilteringMode GetTextureFilter() override;
     void SetSrgbMode() override;
     ImTextureID GetTextureById(int id) override;
+    void* ApplyPostProcess(int fbId) override;
 
   private:
     void SetUniforms(ShaderProgram* prg) const;
     std::string BuildFsShader(const CCFeatures& cc_features);
     void SetPerDrawUniforms();
+    bool InitPostProcess();
 
     std::vector<TextureInfo> textures;
     GLuint mCurrentTextureIds[SHADER_MAX_TEXTURES] = {};
@@ -138,6 +140,19 @@ class GfxRenderingAPIOGL final : public GfxRenderingAPI {
     GLuint mPixelDepthRb = 0;
     GLuint mPixelDepthFb = 0;
     size_t mPixelDepthRbSize = 0;
+
+    // Post-processing (color grading)
+    bool mPostInitTried = false;
+    bool mPostReady = false;
+    GLuint mPostProgram = 0;
+    GLuint mPostVao = 0;
+    GLuint mPostFbo = 0;
+    GLuint mPostTex = 0;
+    uint32_t mPostWidth = 0;
+    uint32_t mPostHeight = 0;
+    GLint mPostLocContrast = -1;
+    GLint mPostLocSaturation = -1;
+    GLint mPostLocWarmth = -1;
 };
 
 } // namespace Fast

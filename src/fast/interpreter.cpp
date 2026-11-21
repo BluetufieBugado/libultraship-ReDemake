@@ -5080,9 +5080,14 @@ void Interpreter::StartFrame() {
 
     mPrvDimensions = mCurDimensions;
     mPrevNativeDimensions = mNativeDimensions;
-    if (!ViewportMatchesRendererResolution() || mMsaaLevel > 1) {
+    // ReDemake: the post-process effect needs the game drawn to its own framebuffer, even when the window size
+    // matches the game resolution (MSAA > 1 is not supported by the effect yet).
+    const bool postFxActive =
+        mMsaaLevel <= 1 &&
+        Ship::Context::GetRawInstance()->GetConsoleVariables()->GetInteger("gEnhancements.RemakePostFx", 0) != 0;
+    if (!ViewportMatchesRendererResolution() || mMsaaLevel > 1 || postFxActive) {
         mRendersToFb = true;
-        if (!ViewportMatchesRendererResolution()) {
+        if (!ViewportMatchesRendererResolution() || postFxActive) {
             mRapi->UpdateFramebufferParameters(mGameFb, mCurDimensions.width, mCurDimensions.height, mMsaaLevel, true,
                                                true, true, true);
         } else {

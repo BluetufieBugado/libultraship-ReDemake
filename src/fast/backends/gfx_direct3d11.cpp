@@ -973,6 +973,8 @@ void* GfxRenderingAPIDX11::GetFramebufferTextureId(int fb_id) {
     return (void*)mTextures[mFrameBuffers[fb_id].texture_id].resource_view.Get();
 }
 
+#include "gfx_direct3d11_postfx.inc"
+
 void GfxRenderingAPIDX11::SelectTextureFb(int fbID) {
     int tile = 0;
     SelectTexture(tile, mFrameBuffers[fbID].texture_id);

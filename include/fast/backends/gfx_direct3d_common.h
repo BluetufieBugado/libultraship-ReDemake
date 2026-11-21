@@ -118,6 +118,7 @@ class GfxRenderingAPIDX11 final : public GfxRenderingAPI {
     FilteringMode GetTextureFilter() override;
     void SetSrgbMode() override;
     ImTextureID GetTextureById(int id) override;
+    void* ApplyPostProcess(int fbId) override;
 
     PFN_D3D11_CREATE_DEVICE mDX11CreateDevice;
     Microsoft::WRL::ComPtr<ID3D11DeviceContext> mContext;
@@ -151,6 +152,22 @@ class GfxRenderingAPIDX11 final : public GfxRenderingAPI {
     Microsoft::WRL::ComPtr<ID3D11ComputeShader> mComputeShaderMsaa;
     Microsoft::WRL::ComPtr<ID3DBlob> mComputeShaderMsaaBlob;
     size_t mCoordBufferSize;
+
+    // ReDemake post-process (color grading)
+    bool InitPostProcess();
+    bool mPostInitTried = false;
+    bool mPostReady = false;
+    Microsoft::WRL::ComPtr<ID3D11VertexShader> mPostVs;
+    Microsoft::WRL::ComPtr<ID3D11PixelShader> mPostPs;
+    Microsoft::WRL::ComPtr<ID3D11Buffer> mPostCb;
+    Microsoft::WRL::ComPtr<ID3D11Texture2D> mPostTex;
+    Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> mPostSrv;
+    Microsoft::WRL::ComPtr<ID3D11RenderTargetView> mPostRtv;
+    Microsoft::WRL::ComPtr<ID3D11RasterizerState> mPostRaster;
+    Microsoft::WRL::ComPtr<ID3D11BlendState> mPostBlend;
+    Microsoft::WRL::ComPtr<ID3D11DepthStencilState> mPostDepth;
+    uint32_t mPostWidth = 0;
+    uint32_t mPostHeight = 0;
 
 #if DEBUG_D3D
     Microsoft::WRL::ComPtr<ID3D11Debug> debug;

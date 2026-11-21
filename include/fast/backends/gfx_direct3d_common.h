@@ -169,6 +169,23 @@ class GfxRenderingAPIDX11 final : public GfxRenderingAPI {
     uint32_t mPostWidth = 0;
     uint32_t mPostHeight = 0;
 
+    // ReDemake bloom
+    bool InitBloom();
+    void DrawBloom(uint32_t width, uint32_t height, float threshold, float intensity);
+    bool mBloomInitTried = false;
+    bool mBloomReady = false;
+    Microsoft::WRL::ComPtr<ID3D11PixelShader> mBloomPsBright;
+    Microsoft::WRL::ComPtr<ID3D11PixelShader> mBloomPsBlur;
+    Microsoft::WRL::ComPtr<ID3D11PixelShader> mBloomPsComp;
+    Microsoft::WRL::ComPtr<ID3D11Buffer> mBloomCb;
+    Microsoft::WRL::ComPtr<ID3D11SamplerState> mBloomSampler;
+    Microsoft::WRL::ComPtr<ID3D11BlendState> mBloomAddBlend;
+    Microsoft::WRL::ComPtr<ID3D11Texture2D> mBloomTex[2];
+    Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> mBloomSrv[2];
+    Microsoft::WRL::ComPtr<ID3D11RenderTargetView> mBloomRtv[2];
+    uint32_t mBloomWidth = 0;
+    uint32_t mBloomHeight = 0;
+
 #if DEBUG_D3D
     Microsoft::WRL::ComPtr<ID3D11Debug> debug;
 #endif

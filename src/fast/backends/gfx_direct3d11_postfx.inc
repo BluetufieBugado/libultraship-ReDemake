@@ -28,6 +28,40 @@ float4 PSMain(float4 pos : SV_Position) : SV_Target {
     c.b += uWarmth * (-0.08 * l + 0.05 * (1.0 - l));
     return float4(saturate(c), 1.0);
 }
+
+// ---- Bloom ----
+cbuffer BloomCB : register(b4) {
+    float4 uA; // xy = 1 / render target size, zw = step (source texel size, or the blur direction)
+    float4 uB; // x = threshold (bright pass) or intensity (composite)
+};
+SamplerState uSmp : register(s0);
+
+float4 PSBright(float4 pos : SV_Position) : SV_Target {
+    float2 uv = pos.xy * uA.xy;
+    float2 o = uA.zw;
+    float3 c = uTex.SampleLevel(uSmp, uv + o * float2(-1.0, -1.0), 0).rgb;
+    c += uTex.SampleLevel(uSmp, uv + o * float2(1.0, -1.0), 0).rgb;
+    c += uTex.SampleLevel(uSmp, uv + o * float2(-1.0, 1.0), 0).rgb;
+    c += uTex.SampleLevel(uSmp, uv + o * float2(1.0, 1.0), 0).rgb;
+    c *= 0.25;
+    float peak = max(c.r, max(c.g, c.b));
+    float k = saturate((peak - uB.x) / max(1.0 - uB.x, 0.01));
+    return float4(c * k, 1.0);
+}
+
+float4 PSBlur(float4 pos : SV_Position) : SV_Target {
+    float2 uv = pos.xy * uA.xy;
+    float2 s = uA.zw;
+    float3 c = uTex.SampleLevel(uSmp, uv, 0).rgb * 0.2270270270;
+    c += (uTex.SampleLevel(uSmp, uv + s * 1.3846153846, 0).rgb + uTex.SampleLevel(uSmp, uv - s * 1.3846153846, 0).rgb) * 0.3162162162;
+    c += (uTex.SampleLevel(uSmp, uv + s * 3.2307692308, 0).rgb + uTex.SampleLevel(uSmp, uv - s * 3.2307692308, 0).rgb) * 0.0702702703;
+    return float4(c, 1.0);
+}
+
+float4 PSComposite(float4 pos : SV_Position) : SV_Target {
+    float2 uv = pos.xy * uA.xy;
+    return float4(uTex.SampleLevel(uSmp, uv, 0).rgb * uB.x, 0.0);
+}
 )";
 
 static int PostClampInt(int v, int lo, int hi) {
@@ -95,6 +129,158 @@ bool GfxRenderingAPIDX11::InitPostProcess() {
         return false;
     }
     return true;
+}
+
+bool GfxRenderingAPIDX11::InitBloom() {
+    const UINT flags = D3DCOMPILE_OPTIMIZATION_LEVEL2;
+    const char* entries[3] = { "PSBright", "PSBlur", "PSComposite" };
+    ComPtr<ID3D11PixelShader>* targets[3] = { &mBloomPsBright, &mBloomPsBlur, &mBloomPsComp };
+    for (int i = 0; i < 3; i++) {
+        ComPtr<ID3DBlob> blob, err;
+        HRESULT hr = mD3dCompile(kPostHlsl, strlen(kPostHlsl), nullptr, nullptr, nullptr, entries[i], "ps_4_0", flags,
+                                 0, blob.GetAddressOf(), err.ReleaseAndGetAddressOf());
+        if (FAILED(hr)) {
+            SPDLOG_ERROR("ReDemake bloom (DX11): {} failed to compile: {}", entries[i],
+                         err ? (const char*)err->GetBufferPointer() : "unknown");
+            return false;
+        }
+        if (FAILED(mDevice->CreatePixelShader(blob->GetBufferPointer(), blob->GetBufferSize(), nullptr,
+                                              targets[i]->GetAddressOf()))) {
+            SPDLOG_ERROR("ReDemake bloom (DX11): failed to create {}", entries[i]);
+            return false;
+        }
+    }
+
+    D3D11_BUFFER_DESC cbDesc;
+    ZeroMemory(&cbDesc, sizeof(cbDesc));
+    cbDesc.Usage = D3D11_USAGE_DYNAMIC;
+    cbDesc.ByteWidth = 32;
+    cbDesc.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
+    cbDesc.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+
+    D3D11_SAMPLER_DESC sd;
+    ZeroMemory(&sd, sizeof(sd));
+    sd.Filter = D3D11_FILTER_MIN_MAG_LINEAR_MIP_POINT;
+    sd.AddressU = D3D11_TEXTURE_ADDRESS_CLAMP;
+    sd.AddressV = D3D11_TEXTURE_ADDRESS_CLAMP;
+    sd.AddressW = D3D11_TEXTURE_ADDRESS_CLAMP;
+    sd.ComparisonFunc = D3D11_COMPARISON_NEVER;
+    sd.MaxLOD = D3D11_FLOAT32_MAX;
+
+    // Additive blending: result = destination + source (the alpha channel stays as it was).
+    D3D11_BLEND_DESC bd;
+    ZeroMemory(&bd, sizeof(bd));
+    bd.RenderTarget[0].BlendEnable = TRUE;
+    bd.RenderTarget[0].SrcBlend = D3D11_BLEND_ONE;
+    bd.RenderTarget[0].DestBlend = D3D11_BLEND_ONE;
+    bd.RenderTarget[0].BlendOp = D3D11_BLEND_OP_ADD;
+    bd.RenderTarget[0].SrcBlendAlpha = D3D11_BLEND_ZERO;
+    bd.RenderTarget[0].DestBlendAlpha = D3D11_BLEND_ONE;
+    bd.RenderTarget[0].BlendOpAlpha = D3D11_BLEND_OP_ADD;
+    bd.RenderTarget[0].RenderTargetWriteMask = D3D11_COLOR_WRITE_ENABLE_ALL;
+
+    if (FAILED(mDevice->CreateBuffer(&cbDesc, nullptr, mBloomCb.GetAddressOf())) ||
+        FAILED(mDevice->CreateSamplerState(&sd, mBloomSampler.GetAddressOf())) ||
+        FAILED(mDevice->CreateBlendState(&bd, mBloomAddBlend.GetAddressOf()))) {
+        SPDLOG_ERROR("ReDemake bloom (DX11): failed to create buffer, sampler or blend state");
+        return false;
+    }
+    return true;
+}
+
+// Runs after the color grading draw, so the vertex shader, topology, rasterizer and depth state of the grading pass
+// are still set. ApplyPostProcess restores the game's own state afterwards.
+void GfxRenderingAPIDX11::DrawBloom(uint32_t width, uint32_t height, float threshold, float intensity) {
+    if (!mBloomInitTried) {
+        mBloomInitTried = true;
+        mBloomReady = InitBloom();
+        SPDLOG_INFO("ReDemake bloom (DX11): shader init {}", mBloomReady ? "OK" : "FAILED");
+    }
+    if (!mBloomReady) {
+        return;
+    }
+
+    const uint32_t qw = (width / 4) > 1 ? (width / 4) : 1;
+    const uint32_t qh = (height / 4) > 1 ? (height / 4) : 1;
+    if (mBloomWidth != qw || mBloomHeight != qh || mBloomSrv[0].Get() == nullptr) {
+        D3D11_TEXTURE2D_DESC td;
+        ZeroMemory(&td, sizeof(td));
+        td.Width = qw;
+        td.Height = qh;
+        td.MipLevels = 1;
+        td.ArraySize = 1;
+        td.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+        td.SampleDesc.Count = 1;
+        td.Usage = D3D11_USAGE_DEFAULT;
+        td.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET;
+        for (int i = 0; i < 2; i++) {
+            if (FAILED(mDevice->CreateTexture2D(&td, nullptr, mBloomTex[i].ReleaseAndGetAddressOf())) ||
+                FAILED(mDevice->CreateShaderResourceView(mBloomTex[i].Get(), nullptr,
+                                                         mBloomSrv[i].ReleaseAndGetAddressOf())) ||
+                FAILED(mDevice->CreateRenderTargetView(mBloomTex[i].Get(), nullptr,
+                                                       mBloomRtv[i].ReleaseAndGetAddressOf()))) {
+                SPDLOG_ERROR("ReDemake bloom (DX11): failed to create textures {}x{}", qw, qh);
+                mBloomSrv[0].Reset();
+                return;
+            }
+        }
+        mBloomWidth = qw;
+        mBloomHeight = qh;
+        SPDLOG_INFO("ReDemake bloom (DX11): working textures {}x{}", qw, qh);
+    }
+
+    ID3D11Buffer* cbs[1] = { mBloomCb.Get() };
+    mContext->PSSetConstantBuffers(4, 1, cbs);
+    ID3D11SamplerState* samplers[1] = { mBloomSampler.Get() };
+    mContext->PSSetSamplers(0, 1, samplers);
+
+    // One full-screen draw: reads "src", writes "dst" (size dstW x dstH). "step" and "param" go to the shader.
+    auto pass = [&](ID3D11PixelShader* ps, ID3D11ShaderResourceView* src, ID3D11RenderTargetView* dst, uint32_t dstW,
+                    uint32_t dstH, float stepX, float stepY, float param) {
+        ID3D11ShaderResourceView* none[1] = { nullptr };
+        mContext->PSSetShaderResources(0, 1, none);
+        ID3D11RenderTargetView* rtvs[1] = { dst };
+        mContext->OMSetRenderTargets(1, rtvs, nullptr);
+        D3D11_VIEWPORT vp;
+        vp.TopLeftX = 0.0f;
+        vp.TopLeftY = 0.0f;
+        vp.Width = (float)dstW;
+        vp.Height = (float)dstH;
+        vp.MinDepth = 0.0f;
+        vp.MaxDepth = 1.0f;
+        mContext->RSSetViewports(1, &vp);
+        D3D11_MAPPED_SUBRESOURCE ms;
+        ZeroMemory(&ms, sizeof(ms));
+        if (FAILED(mContext->Map(mBloomCb.Get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &ms))) {
+            return;
+        }
+        float data[8] = { 1.0f / (float)dstW, 1.0f / (float)dstH, stepX, stepY, param, 0.0f, 0.0f, 0.0f };
+        memcpy(ms.pData, data, sizeof(data));
+        mContext->Unmap(mBloomCb.Get(), 0);
+        mContext->PSSetShader(ps, nullptr, 0);
+        ID3D11ShaderResourceView* srvs[1] = { src };
+        mContext->PSSetShaderResources(0, 1, srvs);
+        mContext->Draw(3, 0);
+    };
+
+    // 1) Keep only the bright parts, shrunk to a quarter of the size.
+    pass(mBloomPsBright.Get(), mPostSrv.Get(), mBloomRtv[0].Get(), qw, qh, 1.0f / (float)width, 1.0f / (float)height,
+         threshold);
+    // 2) Blur: horizontal then vertical, twice.
+    for (int i = 0; i < 2; i++) {
+        pass(mBloomPsBlur.Get(), mBloomSrv[0].Get(), mBloomRtv[1].Get(), qw, qh, 1.0f / (float)qw, 0.0f, 0.0f);
+        pass(mBloomPsBlur.Get(), mBloomSrv[1].Get(), mBloomRtv[0].Get(), qw, qh, 0.0f, 1.0f / (float)qh, 0.0f);
+    }
+    // 3) Add the glow on top of the graded image.
+    const float noBlendFactor[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
+    mContext->OMSetBlendState(mBloomAddBlend.Get(), noBlendFactor, 0xFFFFFFFF);
+    pass(mBloomPsComp.Get(), mBloomSrv[0].Get(), mPostRtv.Get(), width, height, 0.0f, 0.0f, intensity);
+
+    static bool sLoggedBloom = false;
+    if (!sLoggedBloom) {
+        sLoggedBloom = true;
+        SPDLOG_INFO("ReDemake bloom (DX11): drawing (threshold {}, intensity {})", threshold, intensity);
+    }
 }
 
 void* GfxRenderingAPIDX11::ApplyPostProcess(int fb_id) {
@@ -226,6 +412,14 @@ void* GfxRenderingAPIDX11::ApplyPostProcess(int fb_id) {
     ID3D11ShaderResourceView* srvs[1] = { srcTex.resource_view.Get() };
     mContext->PSSetShaderResources(0, 1, srvs);
     mContext->Draw(3, 0);
+
+    if (cvars->GetInteger("gEnhancements.RemakeBloom", 0) != 0) {
+        const float bloomIntensity =
+            PostClampInt(cvars->GetInteger("gEnhancements.RemakeBloomIntensity", 35), 0, 100) / 100.0f * 1.5f;
+        const float bloomThreshold =
+            PostClampInt(cvars->GetInteger("gEnhancements.RemakeBloomThreshold", 70), 30, 95) / 100.0f;
+        DrawBloom(width, height, bloomThreshold, bloomIntensity);
+    }
 
     // Put everything back the way DrawTriangles expects it.
     ID3D11ShaderResourceView* noSrv[1] = { nullptr };

@@ -1257,6 +1257,14 @@ void* GfxRenderingAPIOGL::ApplyPostProcess(int fb_id) {
         std::clamp(cvars->GetInteger("gEnhancements.RemakePostFxSaturation", 120), 0, 200) / 100.0f;
     const float warmth = std::clamp(cvars->GetInteger("gEnhancements.RemakePostFxWarmth", 15), -50, 50) / 100.0f;
 
+    // Remember the renderer's own bookkeeping (blend, bound texture, active texture unit), so that the game
+    // continues exactly where it left off once the effect is done.
+    const auto prevBlend = mLastBlendEnabled;
+    const auto prevActiveTexture = mLastActiveTexture;
+    const auto prevBoundTexture0 = mLastBoundTextures[0];
+    const auto prevCurrentTexture0 = mCurrentTextureIds[0];
+    const auto prevCurrentTile = mCurrentTile;
+
     // (Re)create the output texture when the game image size changes.
     if (mPostWidth != width || mPostHeight != height) {
         SelectTexture(0, mPostTex);
@@ -1308,6 +1316,21 @@ void* GfxRenderingAPIOGL::ApplyPostProcess(int fb_id) {
     if (mLastScissorEnabled != 1) {
         mLastScissorEnabled = 1;
         glEnable(GL_SCISSOR_TEST);
+    }
+    if (mLastBlendEnabled != prevBlend) {
+        mLastBlendEnabled = prevBlend;
+        if (prevBlend) {
+            glEnable(GL_BLEND);
+        } else {
+            glDisable(GL_BLEND);
+        }
+    }
+    SelectTexture(0, prevBoundTexture0);
+    mCurrentTextureIds[0] = prevCurrentTexture0;
+    mCurrentTile = prevCurrentTile;
+    if (mLastActiveTexture != prevActiveTexture) {
+        mLastActiveTexture = prevActiveTexture;
+        glActiveTexture(GL_TEXTURE0 + prevActiveTexture);
     }
 
     return (void*)(uintptr_t)mPostTex;

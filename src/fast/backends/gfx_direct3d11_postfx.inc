@@ -62,6 +62,17 @@ float4 PSComposite(float4 pos : SV_Position) : SV_Target {
     float2 uv = pos.xy * uA.xy;
     return float4(uTex.SampleLevel(uSmp, uv, 0).rgb * uB.x, 0.0);
 }
+
+// ---- Depth debug (Phase 2 test): shows the game's depth buffer as grey levels ----
+Texture2D<float> uDepth : register(t1);
+
+float4 PSDepth(float4 pos : SV_Position) : SV_Target {
+    float d = uDepth.Load(int3((int2)pos.xy, 0));
+    // The depth is 0 (near) to 1 (far) but almost everything sits very close to 1,
+    // so a log scale of (1 - d) spreads it out: dark = near, bright = far.
+    float v = saturate(-log2(max(1.0 - d, 0.000001)) / 20.0);
+    return float4(v, v, v, 1.0);
+}
 )";
 
 static int PostClampInt(int v, int lo, int hi) {
@@ -283,6 +294,9 @@ void GfxRenderingAPIDX11::DrawBloom(uint32_t width, uint32_t height, float thres
     }
 }
 
+static Microsoft::WRL::ComPtr<ID3D11PixelShader> sDepthDbgPs;
+static bool sDepthDbgTried = false;
+
 void* GfxRenderingAPIDX11::ApplyPostProcess(int fb_id) {
     void* original = GetFramebufferTextureId(fb_id);
 
@@ -413,7 +427,45 @@ void* GfxRenderingAPIDX11::ApplyPostProcess(int fb_id) {
     mContext->PSSetShaderResources(0, 1, srvs);
     mContext->Draw(3, 0);
 
-    if (cvars->GetInteger("gEnhancements.RemakeBloom", 0) != 0) {
+    const bool depthDebug = cvars->GetInteger("gEnhancements.RemakeDepthDebug", 0) != 0;
+    if (depthDebug) {
+        if (!sDepthDbgTried) {
+            sDepthDbgTried = true;
+            ComPtr<ID3DBlob> dbgBlob, dbgErr;
+            HRESULT dbgHr = mD3dCompile(kPostHlsl, strlen(kPostHlsl), nullptr, nullptr, nullptr, "PSDepth", "ps_4_0",
+                                        D3DCOMPILE_OPTIMIZATION_LEVEL2, 0, dbgBlob.GetAddressOf(),
+                                        dbgErr.ReleaseAndGetAddressOf());
+            if (FAILED(dbgHr) ||
+                FAILED(mDevice->CreatePixelShader(dbgBlob->GetBufferPointer(), dbgBlob->GetBufferSize(), nullptr,
+                                                  sDepthDbgPs.GetAddressOf()))) {
+                SPDLOG_ERROR("ReDemake depth debug (DX11): shader failed: {}",
+                             dbgErr ? (const char*)dbgErr->GetBufferPointer() : "unknown");
+            } else {
+                SPDLOG_INFO("ReDemake depth debug (DX11): shader init OK");
+            }
+        }
+        if (sDepthDbgPs.Get() != nullptr && srcFb.depth_stencil_srv.Get() != nullptr) {
+            mContext->PSSetShader(sDepthDbgPs.Get(), nullptr, 0);
+            ID3D11ShaderResourceView* depthSrv[1] = { srcFb.depth_stencil_srv.Get() };
+            mContext->PSSetShaderResources(1, 1, depthSrv);
+            mContext->Draw(3, 0);
+            ID3D11ShaderResourceView* noDepthSrv[1] = { nullptr };
+            mContext->PSSetShaderResources(1, 1, noDepthSrv);
+            static bool sLoggedDepth = false;
+            if (!sLoggedDepth) {
+                sLoggedDepth = true;
+                SPDLOG_INFO("ReDemake depth debug (DX11): drawing depth buffer of framebuffer {}", fb_id);
+            }
+        } else {
+            static bool sLoggedNoDepth = false;
+            if (!sLoggedNoDepth) {
+                sLoggedNoDepth = true;
+                SPDLOG_WARN("ReDemake depth debug (DX11): no depth view available on framebuffer {}", fb_id);
+            }
+        }
+    }
+
+    if (!depthDebug && cvars->GetInteger("gEnhancements.RemakeBloom", 0) != 0) {
         const float bloomIntensity =
             PostClampInt(cvars->GetInteger("gEnhancements.RemakeBloomIntensity", 35), 0, 100) / 100.0f * 1.5f;
         const float bloomThreshold =

@@ -66,12 +66,36 @@ float4 PSComposite(float4 pos : SV_Position) : SV_Target {
 // ---- Depth debug (Phase 2 test): shows the game's depth buffer as grey levels ----
 Texture2D<float> uDepth : register(t1);
 
+cbuffer DepthDbgCB : register(b5) {
+    float4 uDbgA; // x = M22, y = M32, z = M23 of the projection, w = 1 when a projection is available
+    float4 uDbgB; // x = band size in game units
+};
+
 float4 PSDepth(float4 pos : SV_Position) : SV_Target {
     float d = uDepth.Load(int3((int2)pos.xy, 0));
-    // The depth is 0 (near) to 1 (far) but almost everything sits very close to 1,
-    // so a log scale of (1 - d) spreads it out: dark = near, bright = far.
-    float v = saturate(-log2(max(1.0 - d, 0.000001)) / 20.0);
-    return float4(v, v, v, 1.0);
+    if (uDbgA.w < 0.5) {
+        // No projection known: plain grey levels on a log scale (dark = near, bright = far).
+        float g = saturate(-log2(max(1.0 - d, 0.000001)) / 20.0);
+        return float4(g, g, g, 1.0);
+    }
+    // Undo the projection: depth -> distance from the camera in game units.
+    float ndc = d * 2.0 - 1.0;
+    float den = ndc * uDbgA.z - uDbgA.x;
+    if (abs(den) < 0.0000001) {
+        den = 0.0000001;
+    }
+    float dist = abs(uDbgA.y / den);
+    // Brightness ramps up every band; the colour changes every 10 bands.
+    float ramp = 0.15 + 0.85 * frac(dist / uDbgB.x);
+    int k = (int)fmod(floor(dist / (uDbgB.x * 10.0)), 3.0);
+    float3 tint = float3(1.0, 0.35, 0.35);
+    if (k == 1) {
+        tint = float3(0.35, 1.0, 0.35);
+    }
+    if (k == 2) {
+        tint = float3(0.4, 0.55, 1.0);
+    }
+    return float4(tint * ramp, 1.0);
 }
 )";
 
@@ -294,6 +318,11 @@ void GfxRenderingAPIDX11::DrawBloom(uint32_t width, uint32_t height, float thres
     }
 }
 
+// Filled by the interpreter (interpreter.cpp): the perspective projection matrices loaded during the frame.
+extern float gReDemakeProj[8][16];
+extern int gReDemakeProjCount;
+
+static Microsoft::WRL::ComPtr<ID3D11Buffer> sDepthDbgCb;
 static Microsoft::WRL::ComPtr<ID3D11PixelShader> sDepthDbgPs;
 static bool sDepthDbgTried = false;
 
@@ -445,12 +474,69 @@ void* GfxRenderingAPIDX11::ApplyPostProcess(int fb_id) {
             }
         }
         if (sDepthDbgPs.Get() != nullptr && srcFb.depth_stencil_srv.Get() != nullptr) {
+            if (sDepthDbgCb.Get() == nullptr) {
+                D3D11_BUFFER_DESC dbgCbDesc;
+                ZeroMemory(&dbgCbDesc, sizeof(dbgCbDesc));
+                dbgCbDesc.Usage = D3D11_USAGE_DYNAMIC;
+                dbgCbDesc.ByteWidth = 32;
+                dbgCbDesc.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
+                dbgCbDesc.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+                mDevice->CreateBuffer(&dbgCbDesc, nullptr, sDepthDbgCb.GetAddressOf());
+            }
+
+            float dbgData[8] = {};
+            const int projCount = gReDemakeProjCount;
+            if (projCount > 0) {
+                int projIdx = PostClampInt(cvars->GetInteger("gEnhancements.RemakeDepthDebugProj", 0), 0, 7);
+                if (projIdx >= projCount) {
+                    projIdx = projCount - 1;
+                }
+                const float* pm = gReDemakeProj[projIdx];
+                dbgData[0] = pm[10]; // M[2][2]
+                dbgData[1] = pm[14]; // M[3][2]
+                dbgData[2] = pm[11]; // M[2][3]
+                dbgData[3] = 1.0f;
+                dbgData[4] = 100.0f; // band size in game units
+            }
+
+            static int sProjLogs = 0;
+            static int sProjFrames = 0;
+            if (projCount > 0 && sProjLogs < 4 && (sProjFrames++ % 300) == 0) {
+                sProjLogs++;
+                for (int i = 0; i < projCount; i++) {
+                    const float* m = gReDemakeProj[i];
+                    const float nearDist = fabsf(m[14] / (-m[11] - m[10]));
+                    const float farDist = fabsf(m[14] / (m[11] - m[10]));
+                    SPDLOG_INFO("ReDemake depth debug (DX11): projection {} of {}: m00={} m11={} m22={} m32={} m23={} "
+                                "m33={} -> near={} far={}",
+                                i, projCount, m[0], m[5], m[10], m[14], m[11], m[15], nearDist, farDist);
+                }
+            }
+            if (projCount == 0) {
+                static bool sLoggedNoProj = false;
+                if (!sLoggedNoProj) {
+                    sLoggedNoProj = true;
+                    SPDLOG_WARN("ReDemake depth debug (DX11): no perspective projection was captured this frame");
+                }
+            }
+
+            D3D11_MAPPED_SUBRESOURCE dbgMs;
+            if (sDepthDbgCb.Get() != nullptr &&
+                SUCCEEDED(mContext->Map(sDepthDbgCb.Get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &dbgMs))) {
+                memcpy(dbgMs.pData, dbgData, sizeof(dbgData));
+                mContext->Unmap(sDepthDbgCb.Get(), 0);
+            }
+            ID3D11Buffer* dbgCbs[1] = { sDepthDbgCb.Get() };
+            mContext->PSSetConstantBuffers(5, 1, dbgCbs);
+
             mContext->PSSetShader(sDepthDbgPs.Get(), nullptr, 0);
             ID3D11ShaderResourceView* depthSrv[1] = { srcFb.depth_stencil_srv.Get() };
             mContext->PSSetShaderResources(1, 1, depthSrv);
             mContext->Draw(3, 0);
             ID3D11ShaderResourceView* noDepthSrv[1] = { nullptr };
             mContext->PSSetShaderResources(1, 1, noDepthSrv);
+            ID3D11Buffer* noDbgCb[1] = { nullptr };
+            mContext->PSSetConstantBuffers(5, 1, noDbgCb);
             static bool sLoggedDepth = false;
             if (!sLoggedDepth) {
                 sLoggedDepth = true;
@@ -464,6 +550,8 @@ void* GfxRenderingAPIDX11::ApplyPostProcess(int fb_id) {
             }
         }
     }
+
+    gReDemakeProjCount = 0;
 
     if (!depthDebug && cvars->GetInteger("gEnhancements.RemakeBloom", 0) != 0) {
         const float bloomIntensity =

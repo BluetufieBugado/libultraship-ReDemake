@@ -1482,6 +1482,26 @@ void Interpreter::CalculateNormalDir(const F3DLight_t* light, float coeffs[3]) {
     Interpreter::NormalizeVector(coeffs);
 }
 
+// ReDemake: remember the perspective (3D world) projection matrices loaded during a frame, so the DirectX 11
+// post-process can rebuild distances from the depth buffer.
+float gReDemakeProj[8][16];
+int gReDemakeProjCount = 0;
+
+static void ReDemakeCaptureProjection(const float* m) {
+    // A perspective matrix has w = -z (m[2][3] is not 0 and m[3][3] is 0). An orthographic one (HUD) does not.
+    if (fabsf(m[11]) < 0.000001f || fabsf(m[15]) > 0.001f) {
+        return;
+    }
+    for (int i = 0; i < gReDemakeProjCount; i++) {
+        if (memcmp(gReDemakeProj[i], m, sizeof(float) * 16) == 0) {
+            return;
+        }
+    }
+    if (gReDemakeProjCount < 8) {
+        memcpy(gReDemakeProj[gReDemakeProjCount++], m, sizeof(float) * 16);
+    }
+}
+
 void Interpreter::GfxSpMatrix(uint8_t parameters, const int32_t* addr) {
     float matrix[4][4];
 
@@ -1535,6 +1555,9 @@ void Interpreter::GfxSpMatrix(uint8_t parameters, const int32_t* addr) {
                       mRsp->modelview_matrix_stack[mRsp->modelview_matrix_stack_size - 1]);
         }
         mRsp->lights_changed = 1;
+    }
+    if (parameters & mtx_projection) {
+        ReDemakeCaptureProjection(&mRsp->P_matrix[0][0]);
     }
     MatrixMul(mRsp->MP_matrix, mRsp->modelview_matrix_stack[mRsp->modelview_matrix_stack_size - 1], mRsp->P_matrix);
 }

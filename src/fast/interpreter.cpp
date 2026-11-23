@@ -1487,6 +1487,14 @@ void Interpreter::CalculateNormalDir(const F3DLight_t* light, float coeffs[3]) {
 float gReDemakeProj[8][16];
 int gReDemakeProjCount = 0;
 
+// ReDemake: point lights (torches, Navi) filled by the game once per frame, in camera space, for the DirectX 11
+// post-process. Each light is 8 floats: x, y, z (camera space), radius, r, g, b (0 to 1), unused.
+// C linkage so the game code (plain C) can write to it.
+extern "C" {
+float gReDemakeLightData[8][8];
+int gReDemakeLightCount = 0;
+}
+
 static void ReDemakeCaptureProjection(const float* m) {
     // A perspective matrix has w = -z (m[2][3] is not 0 and m[3][3] is 0). An orthographic one (HUD) does not.
     if (fabsf(m[11]) < 0.000001f || fabsf(m[15]) > 0.001f) {

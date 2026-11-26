@@ -1504,6 +1504,34 @@ std::function<bool(int)> gReDemakeLightsHook;
 bool gReDemakeLightsApplied = false;
 static bool sReDemakeLightsTried = false;
 
+// ReDemake (temporary diagnostic): where in the frame does the HUD trigger fire? Counts the triangles drawn before the
+// trigger and in the whole frame, plus the perspective projections loaded after the trigger.
+static int sReDemakeTrisThisFrame = 0;
+static int sReDemakeTrisAtHook = -1;
+static int sReDemakePerspAfterHook = 0;
+static float sReDemakeHookMtx[16];
+static int sReDemakeHookFrames = 0;
+static int sReDemakeDiagLogged = 0;
+
+static void ReDemakeDiagFrameStart() {
+    if (sReDemakeTrisAtHook >= 0) {
+        sReDemakeHookFrames++;
+        if ((sReDemakeHookFrames % 120) == 1 && sReDemakeDiagLogged < 8) {
+            sReDemakeDiagLogged++;
+            const float* hm = sReDemakeHookMtx;
+            const int total = sReDemakeTrisThisFrame;
+            const int percent = total > 0 ? (100 * sReDemakeTrisAtHook) / total : 0;
+            SPDLOG_INFO("ReDemake lights diag: HUD trigger fired after {} of {} triangles ({}%), perspective "
+                        "projections loaded after it: {}, trigger matrix m0={} m5={} m10={} m11={} m14={} m15={}",
+                        sReDemakeTrisAtHook, total, percent, sReDemakePerspAfterHook, hm[0], hm[5], hm[10], hm[11],
+                        hm[14], hm[15]);
+        }
+    }
+    sReDemakeTrisThisFrame = 0;
+    sReDemakeTrisAtHook = -1;
+    sReDemakePerspAfterHook = 0;
+}
+
 // Same test as in ReDemakeCaptureProjection, inverted: true for an orthographic (HUD) matrix.
 static bool ReDemakeIsNotPerspective(const float* m) {
     return fabsf(m[11]) < 0.000001f || fabsf(m[15]) > 0.001f;
@@ -1584,10 +1612,16 @@ void Interpreter::GfxSpMatrix(uint8_t parameters, const int32_t* addr) {
         if (!sReDemakeLightsTried && gReDemakeProjCount > 0 && gReDemakeLightsHook && mRendersToFb && !mFbActive &&
             ReDemakeIsNotPerspective(&mRsp->P_matrix[0][0])) {
             sReDemakeLightsTried = true;
+            const int trisBeforeHook = sReDemakeTrisThisFrame;
             Flush();
             if (gReDemakeLightsHook((int)mGameFb)) {
                 gReDemakeLightsApplied = true;
+                sReDemakeTrisAtHook = trisBeforeHook;
+                memcpy(sReDemakeHookMtx, &mRsp->P_matrix[0][0], sizeof(float) * 16);
             }
+        }
+        if (sReDemakeLightsTried && !ReDemakeIsNotPerspective(&mRsp->P_matrix[0][0])) {
+            sReDemakePerspAfterHook++;
         }
     }
     MatrixMul(mRsp->MP_matrix, mRsp->modelview_matrix_stack[mRsp->modelview_matrix_stack_size - 1], mRsp->P_matrix);
@@ -2332,6 +2366,7 @@ void Interpreter::GfxSpTri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx
         // mBufVbo[mBufVboLen++] = color->a / 255.0f;
     }
 
+    sReDemakeTrisThisFrame++;
     if (++mBufVboNumTris == MAX_TRI_BUFFER) {
         // if (++mBufVbo_num_tris == 1) {
         Flush();
@@ -5167,6 +5202,7 @@ void Interpreter::RunGuiOnly() {
     SpReset();
     sReDemakeLightsTried = false;
     gReDemakeLightsApplied = false;
+    ReDemakeDiagFrameStart();
 
     mGetPixelDepthPending.clear();
     mGetPixelDepthCached.clear();
@@ -5209,6 +5245,7 @@ void Interpreter::Run(Gfx* commands, const std::unordered_map<Mtx*, MtxF>& mtx_r
     SpReset();
     sReDemakeLightsTried = false;
     gReDemakeLightsApplied = false;
+    ReDemakeDiagFrameStart();
 
     mGetPixelDepthPending.clear();
     mGetPixelDepthCached.clear();

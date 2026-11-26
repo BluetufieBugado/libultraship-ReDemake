@@ -1537,6 +1537,13 @@ static bool ReDemakeIsNotPerspective(const float* m) {
     return fabsf(m[11]) < 0.000001f || fabsf(m[15]) > 0.001f;
 }
 
+// True only for a real orthographic matrix (the HUD): w does not depend on z (m[11] = 0) and w is constant (m[15] != 0).
+// The game multiplies the view matrix into the perspective matrix, and that product has m[15] != 0 too, but also
+// m[11] != 0, so it is not a HUD matrix. (ReDemakeIsNotPerspective above wrongly accepts it, so it must not be used here.)
+static bool ReDemakeIsHudOrtho(const float* m) {
+    return fabsf(m[11]) < 0.000001f && fabsf(m[15]) > 0.001f;
+}
+
 static void ReDemakeCaptureProjection(const float* m) {
     // A perspective matrix has w = -z (m[2][3] is not 0 and m[3][3] is 0). An orthographic one (HUD) does not.
     if (fabsf(m[11]) < 0.000001f || fabsf(m[15]) > 0.001f) {
@@ -1608,9 +1615,9 @@ void Interpreter::GfxSpMatrix(uint8_t parameters, const int32_t* addr) {
     }
     if (parameters & mtx_projection) {
         ReDemakeCaptureProjection(&mRsp->P_matrix[0][0]);
-        // ReDemake: first non-perspective projection after the 3D world = the HUD starts. Apply the point lights now.
+        // ReDemake: first real orthographic projection after the 3D world = the HUD starts. Apply the point lights now.
         if (!sReDemakeLightsTried && gReDemakeProjCount > 0 && gReDemakeLightsHook && mRendersToFb && !mFbActive &&
-            ReDemakeIsNotPerspective(&mRsp->P_matrix[0][0])) {
+            ReDemakeIsHudOrtho(&mRsp->P_matrix[0][0])) {
             sReDemakeLightsTried = true;
             const int trisBeforeHook = sReDemakeTrisThisFrame;
             Flush();

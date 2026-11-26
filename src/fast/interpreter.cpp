@@ -18,6 +18,7 @@
 #include <vector>
 #include <list>
 #include <stack>
+#include <functional>
 #include "fast/resource/type/Light.h"
 
 #ifndef _LANGUAGE_C
@@ -1495,6 +1496,19 @@ float gReDemakeLightData[8][8];
 int gReDemakeLightCount = 0;
 }
 
+// ReDemake: set by the DirectX 11 backend. The interpreter calls it once per frame, when the 3D world is finished and
+// the HUD (a non-perspective projection) is about to be drawn, so the point lights are applied before the HUD and
+// do not brighten it. It returns true when the lights were applied. gReDemakeLightsApplied tells the backend not to
+// apply them again at the end of the frame.
+std::function<bool(int)> gReDemakeLightsHook;
+bool gReDemakeLightsApplied = false;
+static bool sReDemakeLightsTried = false;
+
+// Same test as in ReDemakeCaptureProjection, inverted: true for an orthographic (HUD) matrix.
+static bool ReDemakeIsNotPerspective(const float* m) {
+    return fabsf(m[11]) < 0.000001f || fabsf(m[15]) > 0.001f;
+}
+
 static void ReDemakeCaptureProjection(const float* m) {
     // A perspective matrix has w = -z (m[2][3] is not 0 and m[3][3] is 0). An orthographic one (HUD) does not.
     if (fabsf(m[11]) < 0.000001f || fabsf(m[15]) > 0.001f) {
@@ -1566,6 +1580,15 @@ void Interpreter::GfxSpMatrix(uint8_t parameters, const int32_t* addr) {
     }
     if (parameters & mtx_projection) {
         ReDemakeCaptureProjection(&mRsp->P_matrix[0][0]);
+        // ReDemake: first non-perspective projection after the 3D world = the HUD starts. Apply the point lights now.
+        if (!sReDemakeLightsTried && gReDemakeProjCount > 0 && gReDemakeLightsHook && mRendersToFb && !mFbActive &&
+            ReDemakeIsNotPerspective(&mRsp->P_matrix[0][0])) {
+            sReDemakeLightsTried = true;
+            Flush();
+            if (gReDemakeLightsHook((int)mGameFb)) {
+                gReDemakeLightsApplied = true;
+            }
+        }
     }
     MatrixMul(mRsp->MP_matrix, mRsp->modelview_matrix_stack[mRsp->modelview_matrix_stack_size - 1], mRsp->P_matrix);
 }
@@ -5142,6 +5165,8 @@ GfxExecStack g_exec_stack = {};
 
 void Interpreter::RunGuiOnly() {
     SpReset();
+    sReDemakeLightsTried = false;
+    gReDemakeLightsApplied = false;
 
     mGetPixelDepthPending.clear();
     mGetPixelDepthCached.clear();
@@ -5182,6 +5207,8 @@ void Interpreter::RunGuiOnly() {
 
 void Interpreter::Run(Gfx* commands, const std::unordered_map<Mtx*, MtxF>& mtx_replacements) {
     SpReset();
+    sReDemakeLightsTried = false;
+    gReDemakeLightsApplied = false;
 
     mGetPixelDepthPending.clear();
     mGetPixelDepthCached.clear();

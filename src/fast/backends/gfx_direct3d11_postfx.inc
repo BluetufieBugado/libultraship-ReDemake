@@ -354,9 +354,15 @@ void GfxRenderingAPIDX11::DrawBloom(uint32_t width, uint32_t height, float thres
     }
 }
 
+#include <functional>
+
 // Filled by the interpreter (interpreter.cpp): the perspective projection matrices loaded during the frame.
 extern float gReDemakeProj[8][16];
 extern int gReDemakeProjCount;
+
+// Set by this backend, called by the interpreter when the HUD starts (see interpreter.cpp).
+extern std::function<bool(int)> gReDemakeLightsHook;
+extern bool gReDemakeLightsApplied;
 
 // Filled by the game (z_actor.c) once per frame: point lights in camera space (see interpreter.cpp).
 extern "C" float gReDemakeLightData[8][8];
@@ -369,6 +375,52 @@ static bool sLightsTried = false;
 static Microsoft::WRL::ComPtr<ID3D11Buffer> sDepthDbgCb;
 static Microsoft::WRL::ComPtr<ID3D11PixelShader> sDepthDbgPs;
 static bool sDepthDbgTried = false;
+
+// Fills the LightsCB constant buffer (19 float4, zeroed by the caller) from this frame's projection and lights.
+static bool ReDemakeBuildLightsCb(float* lightCb, uint32_t width, uint32_t height, float* outIntensity,
+                                  float* outRange, int* outCount) {
+    auto cvars = Ship::Context::GetRawInstance()->GetConsoleVariables();
+    const float* lpm = gReDemakeProj[0];
+    const float aspect = (float)width / (float)height;
+    // The interpreter widens the picture by (4/3) / aspect in x, so the real horizontal scale is:
+    const float scaleX = lpm[0] * (4.0f / 3.0f) / aspect;
+    const float scaleY = lpm[5];
+    if (fabsf(scaleX) <= 0.000001f || fabsf(scaleY) <= 0.000001f) {
+        return false;
+    }
+    const float lightIntensity =
+        PostClampInt(cvars->GetInteger("gEnhancements.RemakeLightsIntensity", 100), 0, 300) / 100.0f;
+    const float lightRange = PostClampInt(cvars->GetInteger("gEnhancements.RemakeLightsRange", 200), 50, 500) / 100.0f;
+    int lightCount = gReDemakeLightCount;
+    if (lightCount > 8) {
+        lightCount = 8;
+    }
+    lightCb[0] = lpm[10]; // M22
+    lightCb[1] = lpm[14]; // M32
+    lightCb[2] = lpm[11]; // M23
+    lightCb[4] = 1.0f / scaleX;
+    lightCb[5] = 1.0f / scaleY;
+    lightCb[6] = 1.0f / (float)width;
+    lightCb[7] = 1.0f / (float)height;
+    lightCb[8] = lightIntensity;
+    lightCb[9] = (float)lightCount;
+    for (int i = 0; i < lightCount; i++) {
+        const float* ld = gReDemakeLightData[i];
+        float* posOut = &lightCb[12 + i * 4];
+        float* colOut = &lightCb[12 + 32 + i * 4];
+        posOut[0] = ld[0];
+        posOut[1] = ld[1];
+        posOut[2] = ld[2];
+        posOut[3] = ld[3] * lightRange;
+        colOut[0] = ld[4];
+        colOut[1] = ld[5];
+        colOut[2] = ld[6];
+    }
+    *outIntensity = lightIntensity;
+    *outRange = lightRange;
+    *outCount = lightCount;
+    return true;
+}
 
 void* GfxRenderingAPIDX11::ApplyPostProcess(int fb_id) {
     void* original = GetFramebufferTextureId(fb_id);
@@ -402,6 +454,169 @@ void* GfxRenderingAPIDX11::ApplyPostProcess(int fb_id) {
     }
     if (!mPostReady) {
         return original;
+    }
+
+    // Compiles the lights shader and creates its blend state and constant buffer (once).
+    auto ensureLights = [this]() -> bool {
+        if (!sLightsTried) {
+            sLightsTried = true;
+            ComPtr<ID3DBlob> lBlob, lErr;
+            HRESULT lHr = mD3dCompile(kPostHlsl, strlen(kPostHlsl), nullptr, nullptr, nullptr, "PSLights", "ps_4_0",
+                                      D3DCOMPILE_OPTIMIZATION_LEVEL2, 0, lBlob.GetAddressOf(),
+                                      lErr.ReleaseAndGetAddressOf());
+            bool lOk = SUCCEEDED(lHr) &&
+                       SUCCEEDED(mDevice->CreatePixelShader(lBlob->GetBufferPointer(), lBlob->GetBufferSize(), nullptr,
+                                                            sLightsPs.GetAddressOf()));
+            if (!lOk) {
+                SPDLOG_ERROR("ReDemake lights (DX11): shader failed: {}",
+                             lErr ? (const char*)lErr->GetBufferPointer() : "unknown");
+            }
+            D3D11_BLEND_DESC lbd;
+            ZeroMemory(&lbd, sizeof(lbd));
+            lbd.RenderTarget[0].BlendEnable = TRUE;
+            lbd.RenderTarget[0].SrcBlend = D3D11_BLEND_DEST_COLOR;
+            lbd.RenderTarget[0].DestBlend = D3D11_BLEND_ONE;
+            lbd.RenderTarget[0].BlendOp = D3D11_BLEND_OP_ADD;
+            lbd.RenderTarget[0].SrcBlendAlpha = D3D11_BLEND_ZERO;
+            lbd.RenderTarget[0].DestBlendAlpha = D3D11_BLEND_ONE;
+            lbd.RenderTarget[0].BlendOpAlpha = D3D11_BLEND_OP_ADD;
+            lbd.RenderTarget[0].RenderTargetWriteMask = D3D11_COLOR_WRITE_ENABLE_ALL;
+            D3D11_BUFFER_DESC lcb;
+            ZeroMemory(&lcb, sizeof(lcb));
+            lcb.Usage = D3D11_USAGE_DYNAMIC;
+            lcb.ByteWidth = 19 * 16;
+            lcb.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
+            lcb.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+            if (lOk && (FAILED(mDevice->CreateBlendState(&lbd, sLightsBlend.GetAddressOf())) ||
+                        FAILED(mDevice->CreateBuffer(&lcb, nullptr, sLightsCb.GetAddressOf())))) {
+                SPDLOG_ERROR("ReDemake lights (DX11): failed to create blend state or constant buffer");
+                sLightsPs.Reset();
+            }
+            if (sLightsPs.Get() != nullptr) {
+                SPDLOG_INFO("ReDemake lights (DX11): shader init OK");
+            }
+        }
+        return sLightsPs.Get() != nullptr && sLightsCb.Get() != nullptr && sLightsBlend.Get() != nullptr;
+    };
+
+    // Hook called by the interpreter when the 3D world is finished and the HUD is about to be drawn: applies the point
+    // lights straight onto the game image (only the world is in it at that moment), so the HUD is not brightened.
+    if (!gReDemakeLightsHook) {
+        gReDemakeLightsHook = [this, ensureLights](int hookFbId) -> bool {
+            auto hcv = Ship::Context::GetRawInstance()->GetConsoleVariables();
+            if (hcv->GetInteger("gEnhancements.RemakePostFx", 0) == 0 ||
+                hcv->GetInteger("gEnhancements.RemakeLights", 0) == 0 ||
+                hcv->GetInteger("gEnhancements.RemakeDepthDebug", 0) != 0 || gReDemakeProjCount <= 0 ||
+                gReDemakeLightCount <= 0) {
+                return false;
+            }
+            if (hookFbId <= 0 || hookFbId >= (int)mFrameBuffers.size()) {
+                return false;
+            }
+            const FramebufferDX11& hFb = mFrameBuffers[hookFbId];
+            const TextureData& hTex = mTextures[hFb.texture_id];
+            if (hFb.msaa_level > 1 || hFb.depth_stencil_srv.Get() == nullptr || hTex.width == 0 || hTex.height == 0) {
+                return false;
+            }
+            if (!ensureLights()) {
+                return false;
+            }
+            float hCb[19 * 4] = {};
+            float hIntensity = 0.0f;
+            float hRange = 0.0f;
+            int hCount = 0;
+            if (!ReDemakeBuildLightsCb(hCb, hTex.width, hTex.height, &hIntensity, &hRange, &hCount)) {
+                return false;
+            }
+            D3D11_MAPPED_SUBRESOURCE hMs;
+            ZeroMemory(&hMs, sizeof(hMs));
+            if (FAILED(mContext->Map(sLightsCb.Get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &hMs))) {
+                return false;
+            }
+            memcpy(hMs.pData, hCb, sizeof(hCb));
+            mContext->Unmap(sLightsCb.Get(), 0);
+
+            // Save the state we are about to change (the game is in the middle of drawing).
+            ComPtr<ID3D11RenderTargetView> hPrevRtv;
+            ComPtr<ID3D11DepthStencilView> hPrevDsv;
+            mContext->OMGetRenderTargets(1, hPrevRtv.GetAddressOf(), hPrevDsv.GetAddressOf());
+            if (hPrevRtv.Get() == nullptr) {
+                return false;
+            }
+            UINT hNumViewports = 1;
+            D3D11_VIEWPORT hPrevViewport;
+            mContext->RSGetViewports(&hNumViewports, &hPrevViewport);
+            ComPtr<ID3D11RasterizerState> hPrevRaster;
+            mContext->RSGetState(hPrevRaster.GetAddressOf());
+            ComPtr<ID3D11DepthStencilState> hPrevDepth;
+            UINT hPrevStencilRef = 0;
+            mContext->OMGetDepthStencilState(hPrevDepth.GetAddressOf(), &hPrevStencilRef);
+            ComPtr<ID3D11BlendState> hPrevBlend;
+            float hPrevBlendFactor[4] = {};
+            UINT hPrevSampleMask = 0xFFFFFFFF;
+            mContext->OMGetBlendState(hPrevBlend.GetAddressOf(), hPrevBlendFactor, &hPrevSampleMask);
+            ComPtr<ID3D11InputLayout> hPrevLayout;
+            mContext->IAGetInputLayout(hPrevLayout.GetAddressOf());
+            D3D11_PRIMITIVE_TOPOLOGY hPrevTopology = D3D_PRIMITIVE_TOPOLOGY_UNDEFINED;
+            mContext->IAGetPrimitiveTopology(&hPrevTopology);
+            ComPtr<ID3D11VertexShader> hPrevVs;
+            mContext->VSGetShader(hPrevVs.GetAddressOf(), nullptr, nullptr);
+            ComPtr<ID3D11PixelShader> hPrevPs;
+            mContext->PSGetShader(hPrevPs.GetAddressOf(), nullptr, nullptr);
+            ComPtr<ID3D11ShaderResourceView> hPrevSrv1;
+            mContext->PSGetShaderResources(1, 1, hPrevSrv1.GetAddressOf());
+            ComPtr<ID3D11Buffer> hPrevCb6;
+            mContext->PSGetConstantBuffers(6, 1, hPrevCb6.GetAddressOf());
+
+            // Draw the lights onto the game image. The depth view must be unbound to read the depth as a texture.
+            ID3D11RenderTargetView* hRtvs[1] = { hPrevRtv.Get() };
+            mContext->OMSetRenderTargets(1, hRtvs, nullptr);
+            D3D11_VIEWPORT hvp;
+            hvp.TopLeftX = 0.0f;
+            hvp.TopLeftY = 0.0f;
+            hvp.Width = (float)hTex.width;
+            hvp.Height = (float)hTex.height;
+            hvp.MinDepth = 0.0f;
+            hvp.MaxDepth = 1.0f;
+            mContext->RSSetViewports(1, &hvp);
+            mContext->RSSetState(mPostRaster.Get());
+            mContext->OMSetDepthStencilState(mPostDepth.Get(), 0);
+            const float hNoBlendFactor[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
+            mContext->OMSetBlendState(sLightsBlend.Get(), hNoBlendFactor, 0xFFFFFFFF);
+            mContext->IASetInputLayout(nullptr);
+            mContext->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+            mContext->VSSetShader(mPostVs.Get(), nullptr, 0);
+            mContext->PSSetShader(sLightsPs.Get(), nullptr, 0);
+            ID3D11Buffer* hCbs[1] = { sLightsCb.Get() };
+            mContext->PSSetConstantBuffers(6, 1, hCbs);
+            ID3D11ShaderResourceView* hDepthSrv[1] = { hFb.depth_stencil_srv.Get() };
+            mContext->PSSetShaderResources(1, 1, hDepthSrv);
+            mContext->Draw(3, 0);
+
+            // Put everything back the way DrawTriangles expects it (the depth view is bound again last).
+            mContext->PSSetShaderResources(1, 1, hPrevSrv1.GetAddressOf());
+            mContext->PSSetConstantBuffers(6, 1, hPrevCb6.GetAddressOf());
+            mContext->OMSetRenderTargets(1, hRtvs, hPrevDsv.Get());
+            mContext->RSSetViewports(1, &hPrevViewport);
+            mContext->RSSetState(hPrevRaster.Get());
+            mContext->OMSetDepthStencilState(hPrevDepth.Get(), hPrevStencilRef);
+            mContext->OMSetBlendState(hPrevBlend.Get(), hPrevBlendFactor, hPrevSampleMask);
+            mContext->IASetInputLayout(hPrevLayout.Get());
+            mContext->IASetPrimitiveTopology(hPrevTopology);
+            mContext->VSSetShader(hPrevVs.Get(), nullptr, 0);
+            mContext->PSSetShader(hPrevPs.Get(), nullptr, 0);
+            // Forget the cached texture view of slot 1 so the next game draw binds its own again.
+            mLastResourceViews[1].Reset();
+
+            static bool sLoggedHudLights = false;
+            if (!sLoggedHudLights) {
+                sLoggedHudLights = true;
+                SPDLOG_INFO("ReDemake lights (DX11): applied before the HUD (mid-frame), {} lights (intensity {}, "
+                            "range {})",
+                            hCount, hIntensity, hRange);
+            }
+            return true;
+        };
     }
 
     // (Re)create the output texture when the game image size changes.
@@ -596,83 +811,15 @@ void* GfxRenderingAPIDX11::ApplyPostProcess(int fb_id) {
     }
 
     // Phase 2: point lights. Multiplies the image by (1 + light), so lit surfaces keep their own colour.
-    if (!depthDebug && cvars->GetInteger("gEnhancements.RemakeLights", 0) != 0 && gReDemakeProjCount > 0 &&
-        gReDemakeLightCount > 0 && srcFb.depth_stencil_srv.Get() != nullptr) {
-        if (!sLightsTried) {
-            sLightsTried = true;
-            ComPtr<ID3DBlob> lBlob, lErr;
-            HRESULT lHr = mD3dCompile(kPostHlsl, strlen(kPostHlsl), nullptr, nullptr, nullptr, "PSLights", "ps_4_0",
-                                      D3DCOMPILE_OPTIMIZATION_LEVEL2, 0, lBlob.GetAddressOf(),
-                                      lErr.ReleaseAndGetAddressOf());
-            bool lOk = SUCCEEDED(lHr) &&
-                       SUCCEEDED(mDevice->CreatePixelShader(lBlob->GetBufferPointer(), lBlob->GetBufferSize(), nullptr,
-                                                            sLightsPs.GetAddressOf()));
-            if (!lOk) {
-                SPDLOG_ERROR("ReDemake lights (DX11): shader failed: {}",
-                             lErr ? (const char*)lErr->GetBufferPointer() : "unknown");
-            }
-            D3D11_BLEND_DESC lbd;
-            ZeroMemory(&lbd, sizeof(lbd));
-            lbd.RenderTarget[0].BlendEnable = TRUE;
-            lbd.RenderTarget[0].SrcBlend = D3D11_BLEND_DEST_COLOR;
-            lbd.RenderTarget[0].DestBlend = D3D11_BLEND_ONE;
-            lbd.RenderTarget[0].BlendOp = D3D11_BLEND_OP_ADD;
-            lbd.RenderTarget[0].SrcBlendAlpha = D3D11_BLEND_ZERO;
-            lbd.RenderTarget[0].DestBlendAlpha = D3D11_BLEND_ONE;
-            lbd.RenderTarget[0].BlendOpAlpha = D3D11_BLEND_OP_ADD;
-            lbd.RenderTarget[0].RenderTargetWriteMask = D3D11_COLOR_WRITE_ENABLE_ALL;
-            D3D11_BUFFER_DESC lcb;
-            ZeroMemory(&lcb, sizeof(lcb));
-            lcb.Usage = D3D11_USAGE_DYNAMIC;
-            lcb.ByteWidth = 19 * 16;
-            lcb.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
-            lcb.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
-            if (lOk && (FAILED(mDevice->CreateBlendState(&lbd, sLightsBlend.GetAddressOf())) ||
-                        FAILED(mDevice->CreateBuffer(&lcb, nullptr, sLightsCb.GetAddressOf())))) {
-                SPDLOG_ERROR("ReDemake lights (DX11): failed to create blend state or constant buffer");
-                sLightsPs.Reset();
-            }
-            if (sLightsPs.Get() != nullptr) {
-                SPDLOG_INFO("ReDemake lights (DX11): shader init OK");
-            }
-        }
-        if (sLightsPs.Get() != nullptr && sLightsCb.Get() != nullptr && sLightsBlend.Get() != nullptr) {
-            const float* lpm = gReDemakeProj[0];
-            const float aspect = (float)width / (float)height;
-            // The interpreter widens the picture by (4/3) / aspect in x, so the real horizontal scale is:
-            const float scaleX = lpm[0] * (4.0f / 3.0f) / aspect;
-            const float scaleY = lpm[5];
-            if (fabsf(scaleX) > 0.000001f && fabsf(scaleY) > 0.000001f) {
-                const float lightIntensity =
-                    PostClampInt(cvars->GetInteger("gEnhancements.RemakeLightsIntensity", 100), 0, 300) / 100.0f;
-                const float lightRange =
-                    PostClampInt(cvars->GetInteger("gEnhancements.RemakeLightsRange", 200), 50, 500) / 100.0f;
-                int lightCount = gReDemakeLightCount;
-                if (lightCount > 8) {
-                    lightCount = 8;
-                }
-                float lightCb[19 * 4] = {};
-                lightCb[0] = lpm[10]; // M22
-                lightCb[1] = lpm[14]; // M32
-                lightCb[2] = lpm[11]; // M23
-                lightCb[4] = 1.0f / scaleX;
-                lightCb[5] = 1.0f / scaleY;
-                lightCb[6] = 1.0f / (float)width;
-                lightCb[7] = 1.0f / (float)height;
-                lightCb[8] = lightIntensity;
-                lightCb[9] = (float)lightCount;
-                for (int i = 0; i < lightCount; i++) {
-                    const float* ld = gReDemakeLightData[i];
-                    float* posOut = &lightCb[12 + i * 4];
-                    float* colOut = &lightCb[12 + 32 + i * 4];
-                    posOut[0] = ld[0];
-                    posOut[1] = ld[1];
-                    posOut[2] = ld[2];
-                    posOut[3] = ld[3] * lightRange;
-                    colOut[0] = ld[4];
-                    colOut[1] = ld[5];
-                    colOut[2] = ld[6];
-                }
+    // Skipped when the interpreter already applied them before the HUD this frame (see gReDemakeLightsHook).
+    if (!depthDebug && !gReDemakeLightsApplied && cvars->GetInteger("gEnhancements.RemakeLights", 0) != 0 &&
+        gReDemakeProjCount > 0 && gReDemakeLightCount > 0 && srcFb.depth_stencil_srv.Get() != nullptr) {
+        if (ensureLights()) {
+            float lightCb[19 * 4] = {};
+            float lightIntensity = 0.0f;
+            float lightRange = 0.0f;
+            int lightCount = 0;
+            if (ReDemakeBuildLightsCb(lightCb, width, height, &lightIntensity, &lightRange, &lightCount)) {
                 D3D11_MAPPED_SUBRESOURCE lms;
                 if (SUCCEEDED(mContext->Map(sLightsCb.Get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &lms))) {
                     memcpy(lms.pData, lightCb, sizeof(lightCb));
@@ -692,13 +839,15 @@ void* GfxRenderingAPIDX11::ApplyPostProcess(int fb_id) {
                     static bool sLoggedLights = false;
                     if (!sLoggedLights) {
                         sLoggedLights = true;
-                        SPDLOG_INFO("ReDemake lights (DX11): drawing {} lights (intensity {}, range {})", lightCount,
-                                    lightIntensity, lightRange);
+                        SPDLOG_INFO("ReDemake lights (DX11): drawing {} lights at the end of the frame (intensity {}, "
+                                    "range {})",
+                                    lightCount, lightIntensity, lightRange);
                     }
                 }
             }
         }
     }
+    gReDemakeLightsApplied = false;
 
     gReDemakeProjCount = 0;
 

@@ -105,6 +105,7 @@ cbuffer LightsCB : register(b6) {
     float4 uLC;      // x = intensity, y = number of lights
     float4 uLPos[8]; // xyz = light position in camera space, w = radius
     float4 uLCol[8]; // rgb = light colour
+    float4 uLD;      // x = shadow steps, y = shadow bias, z = shadow thickness (game units)
 };
 
 float4 PSLights(float4 pos : SV_Position) : SV_Target {
@@ -132,6 +133,89 @@ float4 PSLights(float4 pos : SV_Position) : SV_Target {
         }
     }
     return float4(sum * uLC.x, 0.0);
+}
+
+// ---- Shadow test (Phase 3a): walks from a pixel toward a light through the depth buffer ----
+// Returns 1 when the light reaches the pixel and 0 when something in the depth buffer blocks the way.
+// p and lpos are in camera space. pix is the pixel position (used only to vary the start of the walk per pixel).
+float ShadowFactor(float3 p, float3 lpos, float2 pix) {
+    int steps = (int)uLD.x;
+    float3 way = lpos - p;
+    float jitter = frac(52.9829189 * frac(dot(pix, float2(0.06711056, 0.00583715))));
+    float result = 1.0;
+    [loop]
+    for (int k = 0; k < 32; k++) {
+        if (k >= steps) {
+            break;
+        }
+        float f = ((float)k + 0.2 + 0.6 * jitter) / (float)steps;
+        float3 s = p + way * f;
+        float sDist = -s.z;
+        if (sDist < 10.0) {
+            continue;
+        }
+        float sw = abs(uLA.z) * sDist;
+        float sx = s.x / (sw * uLB.x);
+        float sy = s.y / (sw * uLB.y);
+        float2 suv = float2((sx + 1.0) * 0.5, (1.0 - sy) * 0.5);
+        if (suv.x < 0.0 || suv.x >= 1.0 || suv.y < 0.0 || suv.y >= 1.0) {
+            continue;
+        }
+        int2 ip = int2(suv.x / uLB.z, suv.y / uLB.w);
+        float sd = uDepth.Load(int3(ip, 0));
+        if (sd >= 0.99999) {
+            continue;
+        }
+        float sndc = sd * 2.0 - 1.0;
+        float sden = sndc * uLA.z - uLA.x;
+        if (abs(sden) < 0.0000001) {
+            sden = 0.0000001;
+        }
+        float sceneDist = abs(uLA.y / sden);
+        float gap = sDist - sceneDist;
+        if (gap > uLD.y && gap < uLD.z) {
+            result = 0.0;
+            break;
+        }
+    }
+    return result;
+}
+
+// Shows the light that reaches each pixel as grey (white = full light) and the light that is blocked as red.
+float4 PSShadowMask(float4 pos : SV_Position) : SV_Target {
+    float d = uDepth.Load(int3((int2)pos.xy, 0));
+    if (d >= 0.99999) {
+        return float4(0.0, 0.0, 0.0, 1.0);
+    }
+    float ndcZ = d * 2.0 - 1.0;
+    float den = ndcZ * uLA.z - uLA.x;
+    if (abs(den) < 0.0000001) {
+        den = 0.0000001;
+    }
+    float dist = abs(uLA.y / den);
+    float w = abs(uLA.z) * dist;
+    float ndcX = pos.x * uLB.z * 2.0 - 1.0;
+    float ndcY = 1.0 - pos.y * uLB.w * 2.0;
+    float3 p = float3(ndcX * w * uLB.x, ndcY * w * uLB.y, -dist);
+    float reach = 0.0;
+    float total = 0.0;
+    [loop]
+    for (int i = 0; i < 8; i++) {
+        if (i >= (int)uLC.y) {
+            break;
+        }
+        float3 dv = p - uLPos[i].xyz;
+        float r = uLPos[i].w;
+        float t = saturate(1.0 - dot(dv, dv) / (r * r));
+        t = t * t;
+        if (t > 0.0) {
+            reach += t * ShadowFactor(p, uLPos[i].xyz, pos.xy);
+            total += t;
+        }
+    }
+    reach = saturate(reach);
+    float blocked = saturate(max(total - reach, 0.0));
+    return float4(saturate(reach + blocked), reach, reach, 1.0);
 }
 )";
 
@@ -375,8 +459,10 @@ static bool sLightsTried = false;
 static Microsoft::WRL::ComPtr<ID3D11Buffer> sDepthDbgCb;
 static Microsoft::WRL::ComPtr<ID3D11PixelShader> sDepthDbgPs;
 static bool sDepthDbgTried = false;
+static Microsoft::WRL::ComPtr<ID3D11PixelShader> sShadowMaskPs;
+static bool sShadowMaskTried = false;
 
-// Fills the LightsCB constant buffer (19 float4, zeroed by the caller) from this frame's projection and lights.
+// Fills the LightsCB constant buffer (20 float4, zeroed by the caller) from this frame's projection and lights.
 static bool ReDemakeBuildLightsCb(float* lightCb, uint32_t width, uint32_t height, float* outIntensity,
                                   float* outRange, int* outCount) {
     auto cvars = Ship::Context::GetRawInstance()->GetConsoleVariables();
@@ -416,6 +502,9 @@ static bool ReDemakeBuildLightsCb(float* lightCb, uint32_t width, uint32_t heigh
         colOut[1] = ld[5];
         colOut[2] = ld[6];
     }
+    lightCb[76] = (float)PostClampInt(cvars->GetInteger("gEnhancements.RemakeShadowSteps", 12), 4, 32);
+    lightCb[77] = (float)PostClampInt(cvars->GetInteger("gEnhancements.RemakeShadowBias", 6), 0, 50);
+    lightCb[78] = (float)PostClampInt(cvars->GetInteger("gEnhancements.RemakeShadowThickness", 60), 10, 300);
     *outIntensity = lightIntensity;
     *outRange = lightRange;
     *outCount = lightCount;
@@ -484,7 +573,7 @@ void* GfxRenderingAPIDX11::ApplyPostProcess(int fb_id) {
             D3D11_BUFFER_DESC lcb;
             ZeroMemory(&lcb, sizeof(lcb));
             lcb.Usage = D3D11_USAGE_DYNAMIC;
-            lcb.ByteWidth = 19 * 16;
+            lcb.ByteWidth = 20 * 16;
             lcb.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
             lcb.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
             if (lOk && (FAILED(mDevice->CreateBlendState(&lbd, sLightsBlend.GetAddressOf())) ||
@@ -499,6 +588,27 @@ void* GfxRenderingAPIDX11::ApplyPostProcess(int fb_id) {
         return sLightsPs.Get() != nullptr && sLightsCb.Get() != nullptr && sLightsBlend.Get() != nullptr;
     };
 
+    // Compiles the shadow mask test shader (once).
+    auto ensureShadowMask = [this]() -> bool {
+        if (!sShadowMaskTried) {
+            sShadowMaskTried = true;
+            ComPtr<ID3DBlob> mskBlob, mskErr;
+            HRESULT mskHr = mD3dCompile(kPostHlsl, strlen(kPostHlsl), nullptr, nullptr, nullptr, "PSShadowMask",
+                                        "ps_4_0", D3DCOMPILE_OPTIMIZATION_LEVEL2, 0, mskBlob.GetAddressOf(),
+                                        mskErr.ReleaseAndGetAddressOf());
+            if (FAILED(mskHr) ||
+                FAILED(mDevice->CreatePixelShader(mskBlob->GetBufferPointer(), mskBlob->GetBufferSize(), nullptr,
+                                                  sShadowMaskPs.GetAddressOf()))) {
+                SPDLOG_ERROR("ReDemake shadow mask (DX11): shader failed: {}",
+                             mskErr ? (const char*)mskErr->GetBufferPointer() : "unknown");
+                sShadowMaskPs.Reset();
+            } else {
+                SPDLOG_INFO("ReDemake shadow mask (DX11): shader init OK");
+            }
+        }
+        return sShadowMaskPs.Get() != nullptr;
+    };
+
     // Hook called by the interpreter when the 3D world is finished and the HUD is about to be drawn: applies the point
     // lights straight onto the game image (only the world is in it at that moment), so the HUD is not brightened.
     if (!gReDemakeLightsHook) {
@@ -506,7 +616,8 @@ void* GfxRenderingAPIDX11::ApplyPostProcess(int fb_id) {
             auto hcv = Ship::Context::GetRawInstance()->GetConsoleVariables();
             if (hcv->GetInteger("gEnhancements.RemakePostFx", 0) == 0 ||
                 hcv->GetInteger("gEnhancements.RemakeLights", 0) == 0 ||
-                hcv->GetInteger("gEnhancements.RemakeDepthDebug", 0) != 0 || gReDemakeProjCount <= 0 ||
+                hcv->GetInteger("gEnhancements.RemakeDepthDebug", 0) != 0 ||
+                hcv->GetInteger("gEnhancements.RemakeShadowDebug", 0) != 0 || gReDemakeProjCount <= 0 ||
                 gReDemakeLightCount <= 0) {
                 return false;
             }
@@ -521,7 +632,7 @@ void* GfxRenderingAPIDX11::ApplyPostProcess(int fb_id) {
             if (!ensureLights()) {
                 return false;
             }
-            float hCb[19 * 4] = {};
+            float hCb[20 * 4] = {};
             float hIntensity = 0.0f;
             float hRange = 0.0f;
             int hCount = 0;
@@ -716,6 +827,7 @@ void* GfxRenderingAPIDX11::ApplyPostProcess(int fb_id) {
     mContext->Draw(3, 0);
 
     const bool depthDebug = cvars->GetInteger("gEnhancements.RemakeDepthDebug", 0) != 0;
+    const bool shadowMask = cvars->GetInteger("gEnhancements.RemakeShadowDebug", 0) != 0;
     if (depthDebug) {
         if (!sDepthDbgTried) {
             sDepthDbgTried = true;
@@ -815,7 +927,7 @@ void* GfxRenderingAPIDX11::ApplyPostProcess(int fb_id) {
     if (!depthDebug && !gReDemakeLightsApplied && cvars->GetInteger("gEnhancements.RemakeLights", 0) != 0 &&
         gReDemakeProjCount > 0 && gReDemakeLightCount > 0 && srcFb.depth_stencil_srv.Get() != nullptr) {
         if (ensureLights()) {
-            float lightCb[19 * 4] = {};
+            float lightCb[20 * 4] = {};
             float lightIntensity = 0.0f;
             float lightRange = 0.0f;
             int lightCount = 0;
@@ -826,8 +938,17 @@ void* GfxRenderingAPIDX11::ApplyPostProcess(int fb_id) {
                     mContext->Unmap(sLightsCb.Get(), 0);
                     ID3D11Buffer* lCbs[1] = { sLightsCb.Get() };
                     mContext->PSSetConstantBuffers(6, 1, lCbs);
-                    mContext->OMSetBlendState(sLightsBlend.Get(), noBlendFactor, 0xFFFFFFFF);
-                    mContext->PSSetShader(sLightsPs.Get(), nullptr, 0);
+                    // Shadow mask test: replaces the image with the mask (no blending), otherwise the normal lights.
+                    const bool useMask = shadowMask && ensureShadowMask();
+                    mContext->OMSetBlendState(useMask ? mPostBlend.Get() : sLightsBlend.Get(), noBlendFactor,
+                                              0xFFFFFFFF);
+                    mContext->PSSetShader(useMask ? sShadowMaskPs.Get() : sLightsPs.Get(), nullptr, 0);
+                    static bool sLoggedMask = false;
+                    if (useMask && !sLoggedMask) {
+                        sLoggedMask = true;
+                        SPDLOG_INFO("ReDemake shadow mask (DX11): drawing {} lights (steps {}, bias {}, thickness {})",
+                                    lightCount, lightCb[76], lightCb[77], lightCb[78]);
+                    }
                     ID3D11ShaderResourceView* lDepthSrv[1] = { srcFb.depth_stencil_srv.Get() };
                     mContext->PSSetShaderResources(1, 1, lDepthSrv);
                     mContext->Draw(3, 0);
@@ -851,7 +972,7 @@ void* GfxRenderingAPIDX11::ApplyPostProcess(int fb_id) {
 
     gReDemakeProjCount = 0;
 
-    if (!depthDebug && cvars->GetInteger("gEnhancements.RemakeBloom", 0) != 0) {
+    if (!depthDebug && !shadowMask && cvars->GetInteger("gEnhancements.RemakeBloom", 0) != 0) {
         const float bloomIntensity =
             PostClampInt(cvars->GetInteger("gEnhancements.RemakeBloomIntensity", 35), 0, 100) / 100.0f * 1.5f;
         const float bloomThreshold =
